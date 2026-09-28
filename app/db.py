@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -272,6 +273,18 @@ def init_schema(conn: sqlite3.Connection) -> None:
 
     虚拟时钟在暂停时不推进：重启后这些房间保持暂停，已流逝时间按
     停机前的墙钟差结算进 elapsed_ms，不会丢失也不会偷偷前进。
+
+    每个被冻结的房间在**同一事务**内追加一条与主持人手动暂停完全同格式的
+    `clock` 事件（action='paused'，elapsed_ms 与房间冻结值一致，
+    created_at 取本次恢复时刻）。否则事件时间线里最后一个时钟动作仍是
+    「继续/开始」，app.export 与 app.latency 重建时间线时会把停机后的墙钟
+    时长误计为运行时长——暂停期间（重启后仍处于暂停时）提交的回执/答复
+    会被虚增响应时延，离线回放也会把事件错置到未来的虚拟时刻。追加该事件后，
+    时间线在恢复时刻即冻结到权威值，主持人继续运行后再从该冻结值累计。
+
+    幂等：本函数只冻结 `status = 'running'` 的房间；重复初始化时这些房间
+    已是 paused（或 idle），不会重复追加事件；原本就是 idle/paused 的房间
+    同样不追加。
     """
     _migrate(conn)
     conn.executescript(SCHEMA)
@@ -281,8 +294,18 @@ def init_schema(conn: sqlite3.Connection) -> None:
         elapsed = row["elapsed_ms"]
         if row["last_resume_at"] is not None:
             elapsed += int((now - row["last_resume_at"]) * 1000)
+        elapsed = max(0, elapsed)
+        # 房间冻结与 paused 时钟事件必须同一事务落库：时间线只能见到
+        # 「已冻结房间 + 权威 paused 事件」同时存在的一致状态。
         conn.execute(
             "UPDATE rooms SET status = 'paused', elapsed_ms = ?, last_resume_at = NULL WHERE id = ?",
-            (max(0, elapsed), row["id"]),
+            (elapsed, row["id"]),
+        )
+        conn.execute(
+            "INSERT INTO events (room_id, type, payload, created_at) VALUES (?, 'clock', ?, ?)",
+            (row["id"],
+             json.dumps({"action": "paused", "status": "paused", "elapsed_ms": elapsed},
+                        ensure_ascii=False),
+             now),
         )
     conn.commit()
